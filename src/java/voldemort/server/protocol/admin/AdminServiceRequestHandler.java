@@ -44,6 +44,7 @@ import voldemort.common.nio.ByteBufferBackedInputStream;
 import voldemort.routing.StoreRoutingPlan;
 import voldemort.server.StoreRepository;
 import voldemort.server.VoldemortConfig;
+import voldemort.server.VoldemortServer;
 import voldemort.server.protocol.RequestHandler;
 import voldemort.server.protocol.StreamRequestHandler;
 import voldemort.server.rebalance.Rebalancer;
@@ -100,6 +101,7 @@ public class AdminServiceRequestHandler implements RequestHandler {
     private final VoldemortConfig voldemortConfig;
     private final AsyncOperationService asyncService;
     private final Rebalancer rebalancer;
+    private final VoldemortServer server;
     private FileFetcher fileFetcher;
 
     public AdminServiceRequestHandler(ErrorCodeMapper errorCodeMapper,
@@ -108,12 +110,14 @@ public class AdminServiceRequestHandler implements RequestHandler {
                                       MetadataStore metadataStore,
                                       VoldemortConfig voldemortConfig,
                                       AsyncOperationService asyncService,
-                                      Rebalancer rebalancer) {
+                                      Rebalancer rebalancer,
+                                      VoldemortServer server) {
         this.errorCodeMapper = errorCodeMapper;
         this.storageService = storageService;
         this.metadataStore = metadataStore;
         this.storeRepository = storeRepository;
         this.voldemortConfig = voldemortConfig;
+        this.server = server;
         this.networkClassLoader = new NetworkClassLoader(Thread.currentThread()
                                                                .getContextClassLoader());
         this.asyncService = asyncService;
@@ -259,6 +263,10 @@ public class AdminServiceRequestHandler implements RequestHandler {
                 ProtoUtils.writeMessage(outputStream,
                                         handleDeleteStoreRebalanceState(request.getDeleteStoreRebalanceState()));
                 break;
+            case SET_OFFLINE_STATE:
+                ProtoUtils.writeMessage(outputStream,
+                                        handleSetOfflineState(request.getSetOfflineState()));
+                break;
             case REPAIR_JOB:
                 ProtoUtils.writeMessage(outputStream, handleRepairJob(request.getRepairJob()));
                 break;
@@ -319,6 +327,28 @@ public class AdminServiceRequestHandler implements RequestHandler {
                              e);
             }
         }
+        return response.build();
+    }
+
+    public VAdminProto.SetOfflineStateResponse handleSetOfflineState(VAdminProto.SetOfflineStateRequest request) {
+        VAdminProto.SetOfflineStateResponse.Builder response = VAdminProto.SetOfflineStateResponse.newBuilder();
+
+        try {
+            Boolean setToOffline = request.getOfflineMode();
+            logger.info("Setting OFFLINE_SERVER state to " + setToOffline.toString());
+            metadataStore.setOfflineState(setToOffline);
+            if(setToOffline) {
+                server.stopOnlineServices();
+            } else {
+                server.createOnlineServices();
+                server.startOnlineServices();
+            }
+            // TODO: deal with slop pushing here
+        } catch(VoldemortException e) {
+            response.setError(ProtoUtils.encodeError(errorCodeMapper, e));
+            logger.error("handleSetOfflineState failed for request(" + request.toString() + ")", e);
+        }
+
         return response.build();
     }
 
@@ -524,7 +554,8 @@ public class AdminServiceRequestHandler implements RequestHandler {
         return new UpdateSlopEntriesRequestHandler(request,
                                                    errorCodeMapper,
                                                    storeRepository,
-                                                   voldemortConfig);
+                                                   voldemortConfig,
+                                                   metadataStore);
     }
 
     public StreamRequestHandler handleFetchPartitionEntries(VAdminProto.FetchPartitionEntriesRequest request) {
@@ -577,7 +608,8 @@ public class AdminServiceRequestHandler implements RequestHandler {
                                                                            voldemortConfig,
                                                                            storageEngine,
                                                                            storeRepository,
-                                                                           networkClassLoader);
+                                                                           networkClassLoader,
+                                                                           metadataStore);
         } else {
             // else resort to vector clock based resolving..
             if(doesStorageEngineSupportMultiVersionPuts(storageEngine)) {
@@ -586,7 +618,8 @@ public class AdminServiceRequestHandler implements RequestHandler {
                                                                               voldemortConfig,
                                                                               storageEngine,
                                                                               storeRepository,
-                                                                              networkClassLoader);
+                                                                              networkClassLoader,
+                                                                              metadataStore);
 
             } else {
                 return new UpdatePartitionEntriesStreamRequestHandler(request,
@@ -594,7 +627,8 @@ public class AdminServiceRequestHandler implements RequestHandler {
                                                                       voldemortConfig,
                                                                       storageEngine,
                                                                       storeRepository,
-                                                                      networkClassLoader);
+                                                                      networkClassLoader,
+                                                                      metadataStore);
             }
         }
     }
@@ -816,11 +850,13 @@ public class AdminServiceRequestHandler implements RequestHandler {
         VAdminProto.SwapStoreResponse.Builder response = VAdminProto.SwapStoreResponse.newBuilder();
 
         if(!metadataStore.getServerStateUnlocked()
-                         .equals(MetadataStore.VoldemortState.NORMAL_SERVER)) {
+                         .equals(MetadataStore.VoldemortState.NORMAL_SERVER)
+           && !metadataStore.getServerStateUnlocked()
+                            .equals(MetadataStore.VoldemortState.OFFLINE_SERVER)) {
             response.setError(ProtoUtils.encodeError(errorCodeMapper,
                                                      new VoldemortException("Voldemort server "
                                                                             + metadataStore.getNodeId()
-                                                                            + " not in normal state while swapping store "
+                                                                            + " is neither in normal state nor in offline state while swapping store "
                                                                             + storeName
                                                                             + " with directory "
                                                                             + dir)));
@@ -848,6 +884,11 @@ public class AdminServiceRequestHandler implements RequestHandler {
                                                                                                             .setDescription("Fetch store")
                                                                                                             .setStatus("started");
         try {
+            if(!metadataStore.getReadOnlyFetchEnabledUnlocked()) {
+                throw new VoldemortException("Read-only fetcher is disabled in "
+                                             + metadataStore.getServerStateUnlocked()
+                                             + " state on node " + metadataStore.getNodeId());
+            }
             final ReadOnlyStorageEngine store = getReadOnlyStorageEngine(metadataStore,
                                                                          storeRepository,
                                                                          storeName);
@@ -1350,9 +1391,11 @@ public class AdminServiceRequestHandler implements RequestHandler {
 
         // don't try to delete a store in the middle of rebalancing
         if(!metadataStore.getServerStateUnlocked()
-                         .equals(MetadataStore.VoldemortState.NORMAL_SERVER)) {
+                         .equals(MetadataStore.VoldemortState.NORMAL_SERVER)
+           && !metadataStore.getServerStateUnlocked()
+                            .equals(MetadataStore.VoldemortState.OFFLINE_SERVER)) {
             response.setError(ProtoUtils.encodeError(errorCodeMapper,
-                                                     new VoldemortException("Voldemort server is not in normal state")));
+                                                     new VoldemortException("Voldemort server is neither in normal state nor in offline state")));
             return response.build();
         }
 
@@ -1421,11 +1464,13 @@ public class AdminServiceRequestHandler implements RequestHandler {
     public VAdminProto.AddStoreResponse handleAddStore(VAdminProto.AddStoreRequest request) {
         VAdminProto.AddStoreResponse.Builder response = VAdminProto.AddStoreResponse.newBuilder();
 
-        // don't try to add a store when not in normal state
+        // don't try to add a store when not in normal or offline state
         if(!metadataStore.getServerStateUnlocked()
-                         .equals(MetadataStore.VoldemortState.NORMAL_SERVER)) {
+                         .equals(MetadataStore.VoldemortState.NORMAL_SERVER)
+           && !metadataStore.getServerStateUnlocked()
+                            .equals(MetadataStore.VoldemortState.OFFLINE_SERVER)) {
             response.setError(ProtoUtils.encodeError(errorCodeMapper,
-                                                     new VoldemortException("Voldemort server is not in normal state")));
+                                                     new VoldemortException("Voldemort server is neither in normal state nor in offline state")));
             return response.build();
         }
 

@@ -75,10 +75,12 @@ public abstract class DataMaintenanceJob implements Runnable {
 
     @Override
     public void run() {
-        // don't do maintenance when the server is already not normal
-        if(!isServerNormal()) {
-            getLogger().error("Cannot run " + getJobName()
-                              + " since Voldemort server is not in normal state");
+        // don't do maintenance when the server is already neither normal nor
+        // offline
+        if(!isServerNormal() && !isServerOffline()) {
+            getLogger().error("Cannot run "
+                              + getJobName()
+                              + " since Voldemort server is neither in normal state nor in offline state");
             return;
         }
 
@@ -114,6 +116,11 @@ public abstract class DataMaintenanceJob implements Runnable {
     private boolean isServerNormal() {
         return metadataStore.getServerStateUnlocked()
                             .equals(MetadataStore.VoldemortState.NORMAL_SERVER);
+    }
+
+    private boolean isServerOffline() {
+        return metadataStore.getServerStateUnlocked()
+                            .equals(MetadataStore.VoldemortState.OFFLINE_SERVER);
     }
 
     protected boolean isWritableStore(StoreDefinition storeDef) {

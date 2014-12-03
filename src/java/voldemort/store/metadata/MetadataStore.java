@@ -86,6 +86,9 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
     public static final String SYSTEM_STORES_KEY = "system.stores";
     public static final String SERVER_STATE_KEY = "server.state";
     public static final String NODE_ID_KEY = "node.id";
+    public static final String SLOP_STREAMING_ENABLED_KEY = "slop.streaming.enabled";
+    public static final String PARTITION_STREAMING_ENABLED_KEY = "partition.streaming.enabled";
+    public static final String READONLY_FETCH_ENABLED_KEY = "readonly.fetch.enabled";
     public static final String REBALANCING_STEAL_INFO = "rebalancing.steal.info.key";
     public static final String REBALANCING_SOURCE_CLUSTER_XML = "rebalancing.source.cluster.xml";
     public static final String REBALANCING_SOURCE_STORES_XML = "rebalancing.source.stores.xml";
@@ -96,6 +99,9 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
 
     public static final Set<String> OPTIONAL_KEYS = ImmutableSet.of(SERVER_STATE_KEY,
                                                                     NODE_ID_KEY,
+                                                                    SLOP_STREAMING_ENABLED_KEY,
+                                                                    PARTITION_STREAMING_ENABLED_KEY,
+                                                                    READONLY_FETCH_ENABLED_KEY,
                                                                     REBALANCING_STEAL_INFO,
                                                                     REBALANCING_SOURCE_CLUSTER_XML,
                                                                     REBALANCING_SOURCE_STORES_XML);
@@ -109,8 +115,17 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
     private static final String ROUTING_STRATEGY_KEY = "routing.strategy";
     private static final String SYSTEM_ROUTING_STRATEGY_KEY = "system.routing.strategy";
 
+    /**
+     * Identifies the Voldemort server state.
+     * 
+     * NORMAL_SERVER is the default state; OFFLINE_SERVER is where online
+     * services and slop pushing are turned off, only admin operations
+     * permitted; REBALANCING_MASTER_SERVER is the server state during the
+     * rebalancing operation.
+     */
     public static enum VoldemortState {
         NORMAL_SERVER,
+        OFFLINE_SERVER,
         REBALANCING_MASTER_SERVER
     }
 
@@ -610,6 +625,69 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
 
     }
 
+    public boolean getSlopStreamingEnabledLocked() {
+        // acquire read lock
+        readLock.lock();
+        try {
+            return Boolean.parseBoolean(metadataCache.get(SLOP_STREAMING_ENABLED_KEY)
+                                                     .getValue()
+                                                     .toString());
+        } finally {
+            readLock.unlock();
+
+        }
+    }
+
+    public boolean getSlopStreamingEnabledUnlocked() {
+
+        return Boolean.parseBoolean(metadataCache.get(SLOP_STREAMING_ENABLED_KEY)
+                                                 .getValue()
+                                                 .toString());
+
+    }
+
+    public boolean getPartitionStreamingEnabledLocked() {
+        // acquire read lock
+        readLock.lock();
+        try {
+            return Boolean.parseBoolean(metadataCache.get(PARTITION_STREAMING_ENABLED_KEY)
+                                                     .getValue()
+                                                     .toString());
+        } finally {
+            readLock.unlock();
+
+        }
+    }
+
+    public boolean getPartitionStreamingEnabledUnlocked() {
+
+        return Boolean.parseBoolean(metadataCache.get(PARTITION_STREAMING_ENABLED_KEY)
+                                                 .getValue()
+                                                 .toString());
+
+    }
+
+    public boolean getReadOnlyFetchEnabledLocked() {
+        // acquire read lock
+        readLock.lock();
+        try {
+            return Boolean.parseBoolean(metadataCache.get(READONLY_FETCH_ENABLED_KEY)
+                                                     .getValue()
+                                                     .toString());
+        } finally {
+            readLock.unlock();
+
+        }
+    }
+
+    public boolean getReadOnlyFetchEnabledUnlocked() {
+
+        return Boolean.parseBoolean(metadataCache.get(READONLY_FETCH_ENABLED_KEY)
+                                                 .getValue()
+                                                 .toString());
+
+    }
+
     public RebalancerState getRebalancerState() {
         // acquire read lock
         readLock.lock();
@@ -794,6 +872,62 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
     }
 
     /**
+     * change server state between OFFLINE_SERVER and NORMAL_SERVER
+     * 
+     * @param enabled True if set to OFFLINE_SERVER
+     */
+    public void setOfflineState(boolean setToOffline) {
+        // acquire write lock
+        writeLock.lock();
+        try {
+            String currentState = ByteUtils.getString(get(SERVER_STATE_KEY, null).get(0).getValue(),
+                                                      "UTF-8");
+            if(setToOffline) {
+                // from NORMAL_SERVER to OFFLINE_SERVER
+                if(currentState.equals(VoldemortState.NORMAL_SERVER.toString())) {
+                    put(SERVER_STATE_KEY, VoldemortState.OFFLINE_SERVER);
+                    initCache(SERVER_STATE_KEY);
+                    put(SLOP_STREAMING_ENABLED_KEY, false);
+                    initCache(SLOP_STREAMING_ENABLED_KEY);
+                    put(PARTITION_STREAMING_ENABLED_KEY, false);
+                    initCache(PARTITION_STREAMING_ENABLED_KEY);
+                    put(READONLY_FETCH_ENABLED_KEY, false);
+                    initCache(READONLY_FETCH_ENABLED_KEY);
+                } else if(currentState.equals(VoldemortState.OFFLINE_SERVER.toString())) {
+                    logger.warn("Already in OFFLINE_SERVER state.");
+                    return;
+                } else {
+                    logger.error("Cannot enter OFFLINE_SERVER state from " + currentState);
+                    throw new VoldemortException("Cannot enter OFFLINE_SERVER state from "
+                                                 + currentState);
+                }
+            } else {
+                // from OFFLINE_SERVER to NORMAL_SERVER
+                if(currentState.equals(VoldemortState.NORMAL_SERVER.toString())) {
+                    logger.warn("Already in NORMAL_SERVER state.");
+                    return;
+                } else if(currentState.equals(VoldemortState.OFFLINE_SERVER.toString())) {
+                    put(SERVER_STATE_KEY, VoldemortState.NORMAL_SERVER);
+                    initCache(SERVER_STATE_KEY);
+                    put(SLOP_STREAMING_ENABLED_KEY, true);
+                    initCache(SLOP_STREAMING_ENABLED_KEY);
+                    put(PARTITION_STREAMING_ENABLED_KEY, true);
+                    initCache(PARTITION_STREAMING_ENABLED_KEY);
+                    put(READONLY_FETCH_ENABLED_KEY, true);
+                    initCache(READONLY_FETCH_ENABLED_KEY);
+                    init(getNodeId());
+                } else {
+                    logger.error("Cannot enter NORMAL_SERVER state from " + currentState);
+                    throw new VoldemortException("Cannot enter NORMAL_SERVER state from "
+                                                 + currentState);
+                }
+            }
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /**
      * Function to add a new Store to the Metadata store. This involves
      * 
      * 1. Create a new entry in the ConfigurationStorageEngine for STORES.
@@ -971,6 +1105,9 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
                                        + " (Did you copy config directory ? try deleting .temp .version in config dir to force clean) aborting ...");
 
         // Initialize with default if not present
+        initCache(SLOP_STREAMING_ENABLED_KEY, true);
+        initCache(PARTITION_STREAMING_ENABLED_KEY, true);
+        initCache(READONLY_FETCH_ENABLED_KEY, true);
         initCache(REBALANCING_STEAL_INFO, new RebalancerState(new ArrayList<RebalanceTaskInfo>()));
         initCache(SERVER_STATE_KEY, VoldemortState.NORMAL_SERVER.toString());
         initCache(REBALANCING_SOURCE_CLUSTER_XML, null);
@@ -1132,7 +1269,10 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
         } else if(REBALANCING_STEAL_INFO.equals(key)) {
             RebalancerState rebalancerState = (RebalancerState) value.getValue();
             valueStr = rebalancerState.toJsonString();
-        } else if(SERVER_STATE_KEY.equals(key) || NODE_ID_KEY.equals(key)) {
+        } else if(SERVER_STATE_KEY.equals(key) || NODE_ID_KEY.equals(key)
+                  || SLOP_STREAMING_ENABLED_KEY.equals(key)
+                  || PARTITION_STREAMING_ENABLED_KEY.equals(key)
+                  || READONLY_FETCH_ENABLED_KEY.equals(key)) {
             valueStr = value.getValue().toString();
         } else if(REBALANCING_SOURCE_CLUSTER_XML.equals(key)) {
             if(value.getValue() != null) {
@@ -1177,6 +1317,10 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
             valueObject = VoldemortState.valueOf(value.getValue());
         } else if(NODE_ID_KEY.equals(key)) {
             valueObject = Integer.parseInt(value.getValue());
+        } else if(SLOP_STREAMING_ENABLED_KEY.equals(key)
+                  || PARTITION_STREAMING_ENABLED_KEY.equals(key)
+                  || READONLY_FETCH_ENABLED_KEY.equals(key)) {
+            valueObject = Boolean.parseBoolean(value.getValue());
         } else if(REBALANCING_STEAL_INFO.equals(key)) {
             String valueString = value.getValue();
             if(valueString.startsWith("[")) {

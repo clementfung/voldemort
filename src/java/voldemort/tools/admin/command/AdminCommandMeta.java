@@ -468,7 +468,7 @@ public class AdminCommandMeta extends AbstractAdminCommand {
                 nodeIds = AdminToolUtils.getAllNodeIds(adminClient);
             }
 
-            AdminToolUtils.assertServerInNormalState(adminClient, nodeIds);
+            AdminToolUtils.assertServerNotInRebalancingState(adminClient, nodeIds);
 
             doMetaClearRebalance(adminClient, nodeIds);
         }
@@ -481,6 +481,7 @@ public class AdminCommandMeta extends AbstractAdminCommand {
          * 
          */
         public static void doMetaClearRebalance(AdminClient adminClient, List<Integer> nodeIds) {
+            AdminToolUtils.assertServerNotInOfflineState(adminClient, nodeIds);
             System.out.println("Setting " + MetadataStore.SERVER_STATE_KEY + " to "
                                + MetadataStore.VoldemortState.NORMAL_SERVER);
             doMetaSet(adminClient,
@@ -710,6 +711,7 @@ public class AdminCommandMeta extends AbstractAdminCommand {
     public static class SubCommandMetaSet extends AbstractAdminCommand {
 
         public static final String OPT_HEAD_META_SET = "meta-set";
+        public static final String KEY_OFFLINE = "offline";
 
         /**
          * Initializes parser
@@ -749,19 +751,26 @@ public class AdminCommandMeta extends AbstractAdminCommand {
             stream.println("  meta set - Set metadata on nodes");
             stream.println();
             stream.println("SYNOPSIS");
-            stream.println("  meta set <meta-key>=<meta-file>[,<meta-key2>=<meta-file2>] -u <url>");
+            stream.println("  meta set <meta-key>=<meta-value>[,<meta-key2>=<meta-value2>] -u <url>");
             stream.println("           [-n <node-id-list> | --all-nodes] [--confirm]");
             stream.println();
             stream.println("COMMENTS");
             stream.println("  To set one metadata, please specify one of the following:");
-            stream.println("    " + MetadataStore.CLUSTER_KEY);
+            stream.println("    " + MetadataStore.CLUSTER_KEY
+                           + " (meta-value is cluster.xml file path)");
+            stream.println("    " + MetadataStore.STORES_KEY
+                           + " (meta-value is stores.xml file path)");
+            stream.println("    " + MetadataStore.SLOP_STREAMING_ENABLED_KEY);
+            stream.println("    " + MetadataStore.PARTITION_STREAMING_ENABLED_KEY);
+            stream.println("    " + MetadataStore.READONLY_FETCH_ENABLED_KEY);
             stream.println("    " + MetadataStore.REBALANCING_SOURCE_CLUSTER_XML);
-            stream.println("    " + MetadataStore.SERVER_STATE_KEY);
-            stream.println("    " + MetadataStore.STORES_KEY);
             stream.println("    " + MetadataStore.REBALANCING_STEAL_INFO);
+            stream.println("    " + KEY_OFFLINE);
             stream.println("  To set a pair of metadata values, valid meta keys are:");
-            stream.println("    " + MetadataStore.CLUSTER_KEY);
-            stream.println("    " + MetadataStore.STORES_KEY);
+            stream.println("    " + MetadataStore.CLUSTER_KEY
+                           + " (meta-value is cluster.xml file path)");
+            stream.println("    " + MetadataStore.STORES_KEY
+                           + " (meta-value is stores.xml file path)");
             stream.println();
             getParser().printHelpOn(stream);
             stream.println();
@@ -844,11 +853,11 @@ public class AdminCommandMeta extends AbstractAdminCommand {
                 nodeIds = AdminToolUtils.getAllNodeIds(adminClient);
             }
 
-            AdminToolUtils.assertServerInNormalState(adminClient, nodeIds);
+            AdminToolUtils.assertServerNotInRebalancingState(adminClient, nodeIds);
 
             if(meta.size() == 2) {
-                String metaKey = meta.get(0), metaFile = meta.get(1);
-                metaFile = metaFile.replace("~", System.getProperty("user.home"));
+                String metaKey = meta.get(0), metaValue = meta.get(1);
+                String metaFile = metaValue.replace("~", System.getProperty("user.home"));
 
                 if(metaKey.equals(MetadataStore.CLUSTER_KEY)
                    || metaKey.equals(MetadataStore.REBALANCING_SOURCE_CLUSTER_XML)) {
@@ -858,9 +867,6 @@ public class AdminCommandMeta extends AbstractAdminCommand {
                     ClusterMapper mapper = new ClusterMapper();
                     Cluster newCluster = mapper.readCluster(new File(metaFile));
                     doMetaSet(adminClient, nodeIds, metaKey, mapper.writeCluster(newCluster));
-                } else if(metaKey.equals(MetadataStore.SERVER_STATE_KEY)) {
-                    VoldemortState newState = VoldemortState.valueOf(metaFile);
-                    doMetaSet(adminClient, nodeIds, metaKey, newState.toString());
                 } else if(metaKey.equals(MetadataStore.STORES_KEY)) {
                     if(!Utils.isReadableFile(metaFile)) {
                         throw new VoldemortException("Stores definition xml file path incorrect");
@@ -885,6 +891,18 @@ public class AdminCommandMeta extends AbstractAdminCommand {
                         }
                     }
                     doMetaUpdateVersionsOnStores(adminClient, oldStoreDefs, newStoreDefs);
+                } else if(metaKey.equals(MetadataStore.SLOP_STREAMING_ENABLED_KEY)
+                          || metaKey.equals(MetadataStore.PARTITION_STREAMING_ENABLED_KEY)
+                          || metaKey.equals(MetadataStore.READONLY_FETCH_ENABLED_KEY)) {
+                    doMetaSet(adminClient, nodeIds, metaKey, metaValue);
+                } else if(metaKey.equals(KEY_OFFLINE)) {
+                    boolean setOffline = Boolean.parseBoolean(metaValue);
+                    if(setOffline && nodeIds.size() > 1) {
+                        throw new VoldemortException("Setting more than one node to offline is not allowed.");
+                    }
+                    for(Integer nodeId: nodeIds) {
+                        adminClient.metadataMgmtOps.setRemoteOfflineState(nodeId, setOffline);
+                    }
                 } else if(metaKey.equals(MetadataStore.REBALANCING_STEAL_INFO)) {
                     if(!Utils.isReadableFile(metaFile)) {
                         throw new VoldemortException("Rebalancing steal info file path incorrect");
@@ -1132,7 +1150,7 @@ public class AdminCommandMeta extends AbstractAdminCommand {
 
             AdminClient adminClient = AdminToolUtils.getAdminClient(url);
 
-            AdminToolUtils.assertServerInNormalState(adminClient);
+            AdminToolUtils.assertServerNotInRebalancingState(adminClient);
 
             doMetaSyncVersion(adminClient, nodeId);
         }
@@ -1284,26 +1302,8 @@ public class AdminCommandMeta extends AbstractAdminCommand {
     public static void doMetaSet(AdminClient adminClient,
                                  List<Integer> nodeIds,
                                  String metaKey,
-                                 Object metaValue) {
-        VectorClock updatedVersion = null;
-        for(Integer nodeId: nodeIds) {
-            if(updatedVersion == null) {
-                updatedVersion = (VectorClock) adminClient.metadataMgmtOps.getRemoteMetadata(nodeId,
-                                                                                             metaKey)
-                                                                          .getVersion();
-            } else {
-                updatedVersion = updatedVersion.merge((VectorClock) adminClient.metadataMgmtOps.getRemoteMetadata(nodeId,
-                                                                                                                  metaKey)
-                                                                                               .getVersion());
-            }
-            // Bump up version on first node
-            updatedVersion = updatedVersion.incremented(nodeIds.iterator().next(),
-                                                        System.currentTimeMillis());
-        }
-        adminClient.metadataMgmtOps.updateRemoteMetadata(nodeIds,
-                                                         metaKey,
-                                                         Versioned.value(metaValue.toString(),
-                                                                         updatedVersion));
+                                 String metaValue) {
+        adminClient.metadataMgmtOps.updateRemoteMetadata(nodeIds, metaKey, metaValue);
     }
 
     /**

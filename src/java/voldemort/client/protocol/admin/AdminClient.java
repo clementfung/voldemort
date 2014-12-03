@@ -984,7 +984,6 @@ public class AdminClient {
          * @param key Metadata key to update
          * @param value Value for the metadata key
          */
-
         public void updateRemoteMetadata(int remoteNodeId, String key, Versioned<String> value) {
 
             if(key.equals(STORES_VERSION_KEY)) {
@@ -1051,6 +1050,35 @@ public class AdminClient {
         }
 
         /**
+         * Sets metadata.
+         * 
+         * @param adminClient An instance of AdminClient points to given cluster
+         * @param nodeIds Node ids to set metadata
+         * @param metaKey Metadata key to set
+         * @param metaValue Metadata value to set
+         */
+        public void updateRemoteMetadata(List<Integer> nodeIds, String metaKey, String metaValue) {
+            VectorClock updatedVersion = null;
+            for(Integer nodeId: nodeIds) {
+                if(updatedVersion == null) {
+                    updatedVersion = (VectorClock) metadataMgmtOps.getRemoteMetadata(nodeId,
+                                                                                     metaKey)
+                                                                  .getVersion();
+                } else {
+                    updatedVersion = updatedVersion.merge((VectorClock) metadataMgmtOps.getRemoteMetadata(nodeId,
+                                                                                                          metaKey)
+                                                                                       .getVersion());
+                }
+                // Bump up version on first node
+                updatedVersion = updatedVersion.incremented(nodeIds.iterator().next(),
+                                                            System.currentTimeMillis());
+            }
+            metadataMgmtOps.updateRemoteMetadata(nodeIds,
+                                                 metaKey,
+                                                 Versioned.value(metaValue, updatedVersion));
+        }
+
+        /**
          * Update metadata pair <cluster,stores> at the given remoteNodeId.
          * 
          * @param remoteNodeId Id of the node
@@ -1093,6 +1121,34 @@ public class AdminClient {
                                                                                             VAdminProto.UpdateMetadataPairResponse.newBuilder());
             if(response.hasError())
                 helperOps.throwException(response.getError());
+        }
+
+        /**
+         * Set offline or online state at the given remoteNodeId.
+         * <p>
+         * 
+         * See {@link voldemort.store.metadata.MetadataStore} for more
+         * information.
+         * 
+         * @param remoteNodeId Id of the node
+         * @param setOffline Ture to transit from NORMAL_SERVER to
+         *        OFFLINE_SERVER state, false to transit from OFFLINE_SERVER to
+         *        NORMAL_SERVER state
+         */
+        public void setRemoteOfflineState(int remoteNodeId, boolean setOffline) {
+
+            VAdminProto.VoldemortAdminRequest request = VAdminProto.VoldemortAdminRequest.newBuilder()
+                                                                                         .setType(VAdminProto.AdminRequestType.SET_OFFLINE_STATE)
+                                                                                         .setSetOfflineState(VAdminProto.SetOfflineStateRequest.newBuilder()
+                                                                                                                                               .setOfflineMode(setOffline)
+                                                                                                                                               .build())
+                                                                                         .build();
+            VAdminProto.SetOfflineStateResponse.Builder response = rpcOps.sendAndReceive(remoteNodeId,
+                                                                                         request,
+                                                                                         VAdminProto.SetOfflineStateResponse.newBuilder());
+            if(response.hasError()) {
+                helperOps.throwException(response.getError());
+            }
         }
 
         /**
@@ -1196,6 +1252,15 @@ public class AdminClient {
                                  new Versioned<String>(storeMapper.writeStoreList(finalStoreDefList),
                                                        oldClock.incremented(nodeId, 1)));
 
+        }
+
+        public synchronized void fetchAndUpdateRemoteMetadata(int nodeId, String key, String value) {
+            VectorClock currentClock = (VectorClock) getRemoteMetadata(nodeId, key).getVersion();
+
+            updateRemoteMetadata(nodeId,
+                                 key,
+                                 new Versioned<String>(Boolean.toString(false),
+                                                       currentClock.incremented(nodeId, 1)));
         }
 
         /**
@@ -2812,6 +2877,7 @@ public class AdminClient {
          * @param nodeId The node from which we want to retrieve the state
          * @return The server state
          */
+        // TODO: this method should be moved to helperOps
         public Versioned<VoldemortState> getRemoteServerState(int nodeId) {
             Versioned<String> value = metadataMgmtOps.getRemoteMetadata(nodeId,
                                                                         MetadataStore.SERVER_STATE_KEY);
